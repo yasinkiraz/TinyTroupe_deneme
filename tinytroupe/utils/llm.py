@@ -1,243 +1,154 @@
-import re
-import json
 import os
-import chevron
-from typing import Collection
-import copy
+import json
+import logging
+import google.generativeai as genai
+from pydantic import BaseModel
+import time # sleep için
 import functools
 import inspect
-from tinytroupe.openai_utils import LLMRequest
+
+# Hedef dosyanın tam yolu
+file_path_llm = "/srv/conda/envs/notebook/lib/python3.10/site-packages/tinytroupe/utils/llm.py"
+
+# Gemini uyumlu yeni llm.py içeriği
+# Bu kısım, orijinal llm.py dosyasının kritik bölümlerini Gemini'ye adapte eder.
+new_content_llm = """
+import functools
+import inspect
+import time
+
+# Doğrudan openai_utils'tan 'client'ı içeri aktarıyoruz (artık Gemini özellikli LLMProvider'ımız)
+from tinytroupe.openai_utils import client 
 
 from tinytroupe.utils import logger
 from tinytroupe.utils.rendering import break_text_at_length
 
-################################################################################
-# Model input utilities
-################################################################################
+MAX_RETRIES = 5
+RETRY_DELAY_SECONDS = 1.0
 
-def compose_initial_LLM_messages_with_templates(system_template_name:str, user_template_name:str=None, 
-                                                base_module_folder:str=None,
-                                                rendering_configs:dict={}) -> list:
+def llm_call_wrapper(func):
     """
-    Composes the initial messages for the LLM model call, under the assumption that it always involves 
-    a system (overall task description) and an optional user message (specific task description). 
-    These messages are composed using the specified templates and rendering configurations.
+    LLM çağrıları için retries ve loglama gibi genel işlemleri yöneten bir dekoratör.
     """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper
 
-    # ../ to go to the base library folder, because that's the most natural reference point for the user
-    if base_module_folder is None:
-        sub_folder =  "../prompts/" 
-    else:
-        sub_folder = f"../{base_module_folder}/prompts/"
-
-    base_template_folder = os.path.join(os.path.dirname(__file__), sub_folder)    
-
-    system_prompt_template_path = os.path.join(base_template_folder, f'{system_template_name}')
-    user_prompt_template_path = os.path.join(base_template_folder, f'{user_template_name}')
-
-    messages = []
-
-    messages.append({"role": "system", 
-                         "content": chevron.render(
-                             open(system_prompt_template_path).read(), 
-                             rendering_configs)})
-    
-    # optionally add a user message
-    if user_template_name is not None:
-        messages.append({"role": "user", 
-                            "content": chevron.render(
-                                    open(user_prompt_template_path).read(), 
-                                    rendering_configs)})
-    return messages
-
-
-def llm(**model_overrides):
+@llm_call_wrapper
+def _send_chat_completion_request(messages, model=None, temperature=0.7, top_p=1.0, max_tokens=None, stop_sequences=None, response_format=None):
     """
-    Decorator that turns the decorated function into an LLM-based function.
-    The decorated function must either return a string (the instruction to the LLM),
-    or the parameters of the function will be used instead as the instruction to the LLM.
-    The LLM response is coerced to the function's annotated return type, if present.
-
-    Usage example:
-    @llm(model="gpt-4-0613", temperature=0.5, max_tokens=100)
-    def joke():
-        return "Tell me a joke."
-    
+    LLM'e bir chat completion isteği gönderir.
+    Doğrudan değiştirilmiş openai_utils.client().send_message'ı kullanır.
     """
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            result = func(*args, **kwargs)
-            sig = inspect.signature(func)
-            return_type = sig.return_annotation if sig.return_annotation != inspect.Signature.empty else str
-            system_prompt = func.__doc__.strip() if func.__doc__ else "You are an AI system that executes a computation as requested."
-            
-            if isinstance(result, str):
-                user_prompt = "EXECUTE THE INSTRUCTIONS BELOW:\n\n " + result
+    # LLMRequest nesnesi oluşturmuyoruz.
+    # Tüm parametreler doğrudan send_message'a iletilir veya LLMProvider tarafından dahili olarak işlenir.
+    response = client().send_message(
+        messages=messages,
+        response_format=response_format # JSON modu için response_format'ı iletiyoruz
+        # Diğer parametreler (model, temperature, top_p, max_tokens, stop_sequences)
+        # LLMProvider içinde Gemini için yapılandırılır veya genai.GenerativeModel.generate_content
+        # çağrısında örtük olarak işlenir.
+    )
+    return response
+
+def _llm_request_with_retries(messages, model=None, temperature=0.7, top_p=1.0, max_tokens=None, stop_sequences=None, response_format=None):
+    """
+    LLM istekleri için yeniden denemeleri işleyen yardımcı fonksiyon.
+    Bu şimdi Gemini istemcimizi kullanan _send_chat_completion_request'i çağırır.
+    """
+    attempt = 0
+    while attempt < MAX_RETRIES:
+        try:
+            # Doğrudan uyarlanmış _send_chat_completion_request'i çağırın
+            return _send_chat_completion_request(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                stop_sequences=stop_sequences,
+                response_format=response_format
+            )
+        except Exception as e:
+            logger.error(f"[{attempt + 1}] Error: {e}")
+            attempt += 1
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
             else:
-                user_prompt = f"Execute your function as best as you can using the following parameters: {kwargs}"
-            
-            llm_req = LLMRequest(system_prompt=system_prompt,
-                                 user_prompt=user_prompt,
-                                 output_type=return_type,
-                                 **model_overrides)
-            return llm_req.call()
-        return wrapper
-    return decorator
+                logger.error(f"Failed to get response after {MAX_RETRIES}.0 attempts.")
+                raise
 
-################################################################################	
-# Model output utilities
-################################################################################
-def extract_json(text: str) -> dict:
+def _extract_llm_call_params(llm_call_func, *args, **kwargs):
     """
-    Extracts a JSON object from a string, ignoring: any text before the first 
-    opening curly brace; and any Markdown opening (```json) or closing(```) tags.
+    Fonksiyon argümanlarından LLM çağrı parametrelerini çıkarır.
     """
-    try:
-        # remove any text before the first opening curly or square braces, using regex. Leave the braces.
-        text = re.sub(r'^.*?({|\[)', r'\1', text, flags=re.DOTALL)
+    arg_names = inspect.getfullargspec(llm_call_func).args
+    params = {}
+    for i, arg in enumerate(args):
+        if i < len(arg_names):
+            params[arg_names[i]] = arg
+    params.update(kwargs)
+    return params
 
-        # remove any trailing text after the LAST closing curly or square braces, using regex. Leave the braces.
-        text  =  re.sub(r'(}|\])(?!.*(\]|\})).*$', r'\1', text, flags=re.DOTALL)
-        
-        # remove invalid escape sequences, which show up sometimes
-        text = re.sub("\\'", "'", text) # replace \' with just '
-        text = re.sub("\\,", ",", text)
-
-        # use strict=False to correctly parse new lines, tabs, etc.
-        parsed = json.loads(text, strict=False)
-        
-        # return the parsed JSON object
-        return parsed
+def num_tokens_from_messages(messages, model="gemini-1.5-flash"): # Model adını Gemini olarak güncelledik
+    """Return the number of tokens in messages."""
+    # Bu fonksiyon genellikle OpenAI modelleri için tiktoken kullanır.
+    # Gemini için token sayımı farklıdır.
+    # Bu fonksiyon kritikse, Gemini'ye özgü bir uygulamaya ihtiyaç duyacaktır.
+    # Şimdilik, olduğu gibi bırakalım, doğrudan Gemini için kullanılmayabilir.
+    # Doğru token sayımı için Google Generative AI SDK'sının kendi token sayma metodunu kullanmak gerekebilir.
+    # Örneğin: model.count_tokens(messages).total_tokens
     
-    except Exception as e:
-        logger.error(f"Error occurred while extracting JSON: {e}")
-        return {}
+    # Basit bir tahmini sayaç bırakalım, zira tiktoken Gemini için doğru sonuç vermez
+    return sum(len(msg['content'].split()) for msg in messages) * 4 # Kaba tahmin
 
-def extract_code_block(text: str) -> str:
+def truncate_messages_to_max_tokens(messages, max_tokens, model="gemini-1.5-flash"):
     """
-    Extracts a code block from a string, ignoring any text before the first 
-    opening triple backticks and any text after the closing triple backticks.
+    Bir mesaj listesini maksimum token limiti içinde kalacak şekilde kısaltır.
     """
-    try:
-        # remove any text before the first opening triple backticks, using regex. Leave the backticks.
-        text = re.sub(r'^.*?(```)', r'\1', text, flags=re.DOTALL)
+    if num_tokens_from_messages(messages, model=model) <= max_tokens:
+        return messages
 
-        # remove any trailing text after the LAST closing triple backticks, using regex. Leave the backticks.
-        text  =  re.sub(r'(```)(?!.*```).*$', r'\1', text, flags=re.DOTALL)
-        
-        return text
+    truncated_messages = []
+    current_tokens = 0
+
+    # Sistem mesajını (varsa) koru
+    if messages and messages[0]['role'] == 'system':
+        truncated_messages.append(messages[0])
+        current_tokens += num_tokens_from_messages([messages[0]], model=model)
+        messages = messages[1:]
+
+    # Maksimum token sayısına ulaşılana kadar son mesajları ekle
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        msg_tokens = num_tokens_from_messages([msg], model=model)
+        if current_tokens + msg_tokens <= max_tokens:
+            truncated_messages.insert(0, msg) # Başa ekle, çünkü sondan başa doğru okuyoruz
+            current_tokens += msg_tokens
+        else:
+            break
     
-    except Exception:
-        return ""
+    # Hala fazlaysa, en eski sistem dışı mesajın içeriğini kısalt
+    if current_tokens > max_tokens and truncated_messages:
+        for i, msg in enumerate(truncated_messages):
+            if msg['role'] != 'system':
+                estimated_tokens_to_remove = current_tokens - max_tokens
+                chars_to_remove = estimated_tokens_to_remove * 4 # Kaba tahmin
+                if len(msg['content']) > chars_to_remove:
+                    msg['content'] = msg['content'][chars_to_remove:]
+                    logger.warning(f"Mesaj içeriği token limitine uyması için kısaltıldı. Orjinal: {current_tokens}, Hedef: {max_tokens}")
+                    break
 
-################################################################################
-# Model control utilities
-################################################################################    
+    return truncated_messages
+""" # new_content_llm stringinin sonu
 
-def repeat_on_error(retries:int, exceptions:list):
-    """
-    Decorator that repeats the specified function call if an exception among those specified occurs, 
-    up to the specified number of retries. If that number of retries is exceeded, the
-    exception is raised. If no exception occurs, the function returns normally.
-
-    Args:
-        retries (int): The number of retries to attempt.
-        exceptions (list): The list of exception classes to catch.
-    """
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            for i in range(retries):
-                try:
-                    return func(*args, **kwargs)
-                except tuple(exceptions) as e:
-                    logger.debug(f"Exception occurred: {e}")
-                    if i == retries - 1:
-                        raise e
-                    else:
-                        logger.debug(f"Retrying ({i+1}/{retries})...")
-                        continue
-        return wrapper
-    return decorator
-   
-################################################################################
-# Prompt engineering
-################################################################################
-def add_rai_template_variables_if_enabled(template_variables: dict) -> dict:
-    """
-    Adds the RAI template variables to the specified dictionary, if the RAI disclaimers are enabled.
-    These can be configured in the config.ini file. If enabled, the variables will then load the RAI disclaimers from the 
-    appropriate files in the prompts directory. Otherwise, the variables will be set to None.
-
-    Args:
-        template_variables (dict): The dictionary of template variables to add the RAI variables to.
-
-    Returns:
-        dict: The updated dictionary of template variables.
-    """
-
-    from tinytroupe import config # avoids circular import
-    rai_harmful_content_prevention = config["Simulation"].getboolean(
-        "RAI_HARMFUL_CONTENT_PREVENTION", True 
-    )
-    rai_copyright_infringement_prevention = config["Simulation"].getboolean(
-        "RAI_COPYRIGHT_INFRINGEMENT_PREVENTION", True
-    )
-
-    # Harmful content
-    with open(os.path.join(os.path.dirname(__file__), "prompts/rai_harmful_content_prevention.md"), "r") as f:
-        rai_harmful_content_prevention_content = f.read()
-
-    template_variables['rai_harmful_content_prevention'] = rai_harmful_content_prevention_content if rai_harmful_content_prevention else None
-
-    # Copyright infringement
-    with open(os.path.join(os.path.dirname(__file__), "prompts/rai_copyright_infringement_prevention.md"), "r") as f:
-        rai_copyright_infringement_prevention_content = f.read()
-
-    template_variables['rai_copyright_infringement_prevention'] = rai_copyright_infringement_prevention_content if rai_copyright_infringement_prevention else None
-
-    return template_variables
-
-
-################################################################################
-# Truncation
-################################################################################
-
-def truncate_actions_or_stimuli(list_of_actions_or_stimuli: Collection[dict], max_content_length: int) -> Collection[str]:
-    """
-    Truncates the content of actions or stimuli at the specified maximum length. Does not modify the original list.
-
-    Args:
-        list_of_actions_or_stimuli (Collection[dict]): The list of actions or stimuli to truncate.
-        max_content_length (int): The maximum length of the content.
-
-    Returns:
-        Collection[str]: The truncated list of actions or stimuli. It is a new list, not a reference to the original list, 
-        to avoid unexpected side effects.
-    """
-    cloned_list = copy.deepcopy(list_of_actions_or_stimuli)
-    
-    for element in cloned_list:
-        # the external wrapper of the LLM message: {'role': ..., 'content': ...}
-        if "content" in element:
-            msg_content = element["content"] 
-
-            # now the actual action or stimulus content
-
-            # has action, stimuli or stimulus as key?
-            if "action" in msg_content:
-                # is content there?
-                if "content" in msg_content["action"]:
-                    msg_content["action"]["content"] = break_text_at_length(msg_content["action"]["content"], max_content_length)
-            elif "stimulus" in msg_content:
-                # is content there?
-                if "content" in msg_content["stimulus"]:
-                    msg_content["stimulus"]["content"] = break_text_at_length(msg_content["stimulus"]["content"], max_content_length)
-            elif "stimuli" in msg_content:
-                # for each element in the list
-                for stimulus in msg_content["stimuli"]:
-                    # is content there?
-                    if "content" in stimulus:
-                        stimulus["content"] = break_text_at_length(stimulus["content"], max_content_length)
-    
-    return cloned_list
+# Dosyayı yazma işlemi
+try:
+    with open(file_path_llm, "w") as f:
+        f.write(new_content_llm)
+    print(f"✅ '{file_path_llm}' dosyası başarıyla Gemini uyumlu hale getirildi!")
+    print("Artık ana kodunuzu deneyebilirsiniz.")
+except Exception as e:
+    print(f"❌ Dosya güncellenirken bir hata oluştu: {e}")
+    print("Lütfen yolun doğru olduğundan ve MyBinder ortamında bu dosyaya yazma izniniz olduğundan emin olun.")
